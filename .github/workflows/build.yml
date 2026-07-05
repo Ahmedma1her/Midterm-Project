@@ -1,0 +1,115 @@
+name: Build Pipeline
+run-name: Build ${{ github.event.inputs.target }} for ${{ github.event.inputs.environment }}
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Services to Build'
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+          - both
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-scan:
+    environment: ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Extract Git Commit SHA for unique image tagging
+      - name: Set Short Git Commit SHA
+        id: vars
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # 3. Configure AWS Credentials
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 4. Log in to Amazon ECR
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 5. Set up Docker Buildx (Required for advanced build-push actions cache/features)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ==========================================
+      # BACKEND BUILD, SCAN, AND PUSH
+      # ==========================================
+      
+      # 6. Build Backend Image Locally (push: false so we can scan it first)
+      - name: Build Backend Image Locally
+        if: github.event.inputs.target == 'backend' || github.event.inputs.target == 'both'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          load: true # Loads the image into the local Docker daemon for scanning
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-backend:${{ steps.vars.outputs.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-backend:latest
+
+      # 7. Run Trivy Scan on Local Backend Image
+      - name: Run Trivy Scan on Backend Image
+        if: github.event.inputs.target == 'backend' || github.event.inputs.target == 'both'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0 # Using stable defined version
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-backend:${{ steps.vars.outputs.sha }}
+          format: 'table'
+          exit-code: '1' # Fails workflow if critical vulnerabilities are found
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL'
+
+      # ==========================================
+      # FRONTEND BUILD, SCAN, AND PUSH
+      # ==========================================
+
+      # 9. Build Frontend Image Locally
+      - name: Build Frontend Image Locally
+        if: github.event.inputs.target == 'frontend' || github.event.inputs.target == 'both'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          load: true
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-frontend:${{ steps.vars.outputs.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-frontend:latest
+
+      # 10. Run Trivy Scan on Local Frontend Image
+      - name: Run Trivy Scan on Frontend Image
+        if: github.event.inputs.target == 'frontend' || github.event.inputs.target == 'both'
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ github.event.inputs.environment }}-frontend:${{ steps.vars.outputs.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL'
